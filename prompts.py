@@ -74,7 +74,23 @@ GEMINI_SIGNAL_PROMPT = """You are an Intent Signal scout for an Australian RTO (
 
 Use Google Search to find recent (last 90 days preferred) public hiring or growth signals from {vertical} sector companies operating in {state}, Australia.
 
-Acceptable sources: company press releases, ASX announcements, government tender award registers (AusTender, state procurement), industry publications, mainstream news. Do NOT attempt to scrape LinkedIn directly.
+Acceptable sources, in rough priority order:
+- Company press releases and newsroom pages
+- ASX announcements (asx.com.au) and other listed-company disclosures
+- Government tender award registers — AusTender (tenders.gov.au), state procurement portals (eTendering NSW, BuyVic, etc.)
+- Industry trade publications (e.g. Australian Mining, Inside Construction, AusBiotech, Australasian Pathology)
+- Mainstream business and regional news
+- Public LinkedIn content INDEXED BY GOOGLE — specifically:
+  * LinkedIn Pulse articles (linkedin.com/pulse/...)
+  * Public company-page posts (linkedin.com/company/.../posts/...)
+  * Public posts from executives or operational leaders (linkedin.com/posts/...)
+
+How to use LinkedIn content correctly:
+- Find it through Google's public web index, the same way you find any other source. Do NOT attempt to access LinkedIn directly, log in, scrape pages, or use any tool that bypasses LinkedIn's authentication.
+- If a LinkedIn URL appears in Google's results but the page itself isn't visible without login, skip it. Don't infer content you can't actually see.
+- Useful LinkedIn signals: specific operational claims (new hires with role and count, contract wins, new facilities, expansion timelines, hiring rounds) posted by people in operational, hiring, executive, or HR roles. A COO posting "we just hired our 15th lab tech this quarter" is a strong signal.
+- Skip the noise: generic motivational posts, work-anniversary posts, conference selfies, personal opinion pieces, recycled industry commentary, "thoughts on AI" etc. These are not signals.
+- When a LinkedIn post matches a more authoritative source (e.g. the same hiring announcement appears in a press release), prefer the authoritative source's URL.
 
 Signal types to prioritise for {vertical}:
 {signal_types}
@@ -102,6 +118,53 @@ Rules:
 - Return at most {max_signals} signals, ranked by recency and relevance.
 - If you cannot find any qualifying signals, return {{"signals": []}}.
 - Do not fabricate companies, URLs, or details. Only report what you can ground in search results.
+"""
+
+
+# --- Claude Haiku: build a signal from a manually-pasted URL or text ---
+# Used when a salesperson finds a signal themselves (e.g. on LinkedIn while
+# logged in) and pastes it into the app instead of relying on the auto-scan.
+MANUAL_SIGNAL_PROMPT = """You are processing a manually-found signal for an Australian RTO sales intelligence tool.
+
+A salesperson found a post or article they think indicates a hiring or growth signal in the {vertical} sector. They've given you the URL and (usually) the body text. Your job is to build a complete signal record in the same schema the auto-discovery scan produces, plus the enriched fields the downstream sequence drafter expects.
+
+Return STRICT JSON in this exact schema. No markdown fences, no commentary, no prose before or after:
+
+{{
+  "company": "<company name>",
+  "signal_type": "<concise description of what kind of signal this is — hiring round, contract win, expansion, etc.>",
+  "headline": "<short factual headline>",
+  "date": "<YYYY-MM-DD if known, otherwise 'recent'>",
+  "location": "<city, state if stated, otherwise 'unknown'>",
+  "source_url": "{url}",
+  "snippet": "<2-3 sentence factual summary of the trigger>",
+  "team_size_hint": "<rough estimate of roles affected, or 'unknown'>",
+  "urgency": "<low | medium | high>",
+  "contract_value": "<dollar amount with currency or 'unknown'>",
+  "project_duration": "<e.g. '24 months', 'multi-year', 'unknown'>",
+  "named_individuals": [
+    {{"name": "<full name>", "role": "<their stated role>"}}
+  ],
+  "team_size_estimate": "<refined estimate or 'unknown'>",
+  "operational_problem": "<1-2 sentences: what specific operational pressure this creates in the next 30-90 days>",
+  "skills_implied": ["<technical capability 1>", "<technical capability 2>"],
+  "geographic_footprint": "<specific sites or regions, or 'unknown'>",
+  "confidence": "<high | medium | low>"
+}}
+
+Rules:
+- Do not fabricate. If the content doesn't say it, return 'unknown' or an empty list.
+- If the content is a LinkedIn post, `named_individuals` should INCLUDE the poster — capture their name and stated role (the role is usually in their LinkedIn headline or in the post body).
+- Set urgency to "high" only for genuinely time-pressured signals — major contract wins with tight ramp-ups, large hiring rounds (>10 roles), explicit deadlines in the next 60-90 days. Otherwise "medium" or "low".
+- `confidence` reflects how well-evidenced the extraction is: 'high' if the content is substantial and the fields are clearly stated, 'low' if the content is thin and you had to infer.
+- If you cannot identify a clear company or coherent operational signal from the content, return ONLY this instead of the schema above:
+  {{"error": "<one-sentence reason — e.g. 'Content does not name a specific company' or 'Post is generic industry commentary, not an actionable signal'>"}}
+
+# URL
+{url}
+
+# CONTENT
+{content}
 """
 
 

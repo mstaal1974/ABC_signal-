@@ -27,6 +27,7 @@ import auth
 import compliance
 import enrichment
 import llm_clients
+import apollo
 from prompts import VERTICAL_CONTEXT
 
 # ----------------------------------------------------------------------
@@ -95,10 +96,30 @@ with st.sidebar:
         ),
     )
 
+    apollo_configured = apollo.is_configured()
+    augment_apollo = st.toggle(
+        "Augment with Apollo contacts",
+        value=apollo_configured,
+        disabled=not apollo_configured,
+        help=(
+            "If enabled, query Apollo.io for candidate contacts at each "
+            "signal's company (Lab/Quality/Operations managers etc., filtered "
+            "to Australia). Apollo People Search is free — no credits "
+            "consumed. Revealing a contact's email costs 1 credit per click."
+            if apollo_configured
+            else "Add `apollo = \"...\"` under [api_keys] in secrets.toml "
+            "to enable. Use a master API key from Apollo Settings > "
+            "Integrations > API."
+        ),
+    )
+
     st.divider()
     st.caption("RTO #5800")
     st.caption("Compliance Firewall: **ENABLED**")
     st.caption("Scope: public web sources only (no LinkedIn scraping)")
+    st.caption(
+        "Apollo: **" + ("configured" if apollo_configured else "not configured") + "**"
+    )
 
 # ----------------------------------------------------------------------
 # Main panel
@@ -106,7 +127,11 @@ with st.sidebar:
 st.title("🎯 Intent Signals Console")
 st.caption(f"{vertical} · {state}")
 
-tab_scan, tab_generate = st.tabs(["1 · Scan Signals", "2 · Generate Sequence"])
+tab_scan, tab_paste, tab_generate = st.tabs([
+    "1 · Scan signals",
+    "🔗 Paste signal",
+    "2 · Generate sequence",
+])
 
 
 # --- Scan tab ---------------------------------------------------------
@@ -138,7 +163,11 @@ with tab_scan:
                 "extracting operational detail..."
             ):
                 try:
-                    signals = enrichment.enrich_signals(claude_client, signals)
+                    signals = enrichment.enrich_signals(
+                        claude_client,
+                        signals,
+                        apollo_vertical=vertical if augment_apollo else None,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     st.warning(
                         f"Enrichment pass failed: {exc}. Showing headline-level "
@@ -263,6 +292,55 @@ with tab_scan:
                         "Using headline-level detail only."
                     )
 
+                # --- Apollo contacts (shown independent of fetch_status) ---
+                apollo_contacts = sig.get("apollo_contacts") or []
+                if apollo_contacts:
+                    st.markdown("---")
+                    st.markdown(
+                        "**Apollo contacts** _(speculative — these are people "
+                        "Apollo says work at this company in relevant roles; "
+                        "they are not necessarily named in the source article)_"
+                    )
+                    revealed = st.session_state.setdefault("revealed_emails", {})
+                    for contact in apollo_contacts:
+                        c1, c2 = st.columns([3, 1])
+                        with c1:
+                            name = contact.get("name", "")
+                            title = contact.get("title", "")
+                            li_url = contact.get("linkedin_url", "")
+                            line = f"**{name}**"
+                            if title:
+                                line += f" — *{title}*"
+                            if li_url:
+                                line += f"  ·  [LinkedIn]({li_url})"
+                            st.markdown(line)
+                            apollo_id = contact.get("apollo_id", "")
+                            if apollo_id in revealed:
+                                email = revealed[apollo_id]
+                                if email:
+                                    st.markdown(f"📧 `{email}`")
+                                else:
+                                    st.caption("No email on file in Apollo.")
+                        with c2:
+                            apollo_id = contact.get("apollo_id", "")
+                            if apollo_id and apollo_id not in revealed:
+                                if st.button(
+                                    "Reveal email (1 credit)",
+                                    key=f"reveal_{i}_{apollo_id}",
+                                    use_container_width=True,
+                                ):
+                                    with st.spinner("Revealing..."):
+                                        revealed[apollo_id] = apollo.reveal_email(
+                                            apollo_id
+                                        )
+                                    st.rerun()
+                elif augment_apollo and sig.get("company"):
+                    st.markdown("---")
+                    st.caption(
+                        "🔍 Apollo found no relevant contacts at this company. "
+                        "Common for smaller AU operators or unusual company names."
+                    )
+
                 if st.button("Use this signal →", key=f"use_{i}"):
                     st.session_state.selected_signal = sig
                     st.session_state.selected_signal_idx = i
@@ -284,14 +362,89 @@ with tab_scan:
         )
 
 
+# --- Paste tab -------------------------------------------------------
+with tab_paste:
+    st.markdown("### Paste a signal you found yourself")
+    st.markdown(
+        "Spotted a useful LinkedIn post, press release, or industry article "
+        "on your own? Paste it here and Claude will build a structured signal "
+        "from it. Then jump to **Generate sequence** to draft the outreach."
+    )
+
+    st.markdown("**Source URL** (required)")
+    paste_url = st.text_input(
+        "URL",
+        placeholder="https://www.linkedin.com/posts/...  or  https://example.com.au/news/...",
+        label_visibility="collapsed",
+        key="paste_url",
+    )
+
+    st.markdown("**Post or article text** (paste here — required for LinkedIn)")
+    st.caption(
+        "LinkedIn typically blocks anonymous fetches, so paste the post body "
+        "directly. For press releases and news articles, you can usually leave "
+        "this blank and we'll fetch the URL."
+    )
+    paste_text = st.text_area(
+        "Text",
+        placeholder="Paste the post or article body here...",
+        height=220,
+        label_visibility="collapsed",
+        key="paste_text",
+    )
+
+    build = st.button("✍️ Build signal", type="primary", key="build_signal")
+
+    if build:
+        if not paste_url.strip():
+            st.error("A source URL is required, even if you paste the text.")
+        else:
+            with st.spinner("Building signal from your input..."):
+                signal = None
+                error: str | None = None
+                try:
+                    signal = enrichment.build_signal_from_input(
+                        claude_client,
+                        url=paste_url.strip(),
+                        vertical=vertical,
+                        pasted_text=paste_text.strip() or None,
+                        augment_with_apollo=augment_apollo,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    error = str(exc)
+                except Exception as exc:  # noqa: BLE001
+                    error = f"Unexpected error: {exc}"
+
+            if error:
+                st.error(error)
+            elif signal and "error" in signal and "company" not in signal:
+                st.warning(
+                    f"Couldn't extract a usable signal from that content: "
+                    f"{signal['error']}"
+                )
+            elif signal:
+                st.session_state.selected_signal = signal
+                st.session_state.selected_signal_idx = None
+                st.session_state.pop("sequence", None)
+                st.session_state.pop("compliance_result", None)
+                st.success(
+                    f"Built signal: **{signal.get('company', 'unknown')}** — "
+                    f"*{signal.get('headline', '')}*. Open the "
+                    "**Generate sequence** tab to draft the outreach."
+                )
+                with st.expander("Built signal details"):
+                    st.json(signal)
+
+
 # --- Generate tab -----------------------------------------------------
 with tab_generate:
     signal = st.session_state.get("selected_signal")
 
     if not signal:
         st.info(
-            "Select a signal from the **Scan Signals** tab first. "
-            "The Compliance Firewall runs automatically on every draft."
+            "Pick a signal first — either scan automatically in **Scan signals**, "
+            "or paste one in **Paste signal**. The Compliance Firewall runs "
+            "automatically on every draft."
         )
     else:
         st.markdown(

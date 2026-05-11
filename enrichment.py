@@ -35,7 +35,7 @@ import anthropic
 import httpx
 import trafilatura
 
-from prompts import ENRICHMENT_PROMPT
+from prompts import ENRICHMENT_PROMPT, MANUAL_SIGNAL_PROMPT
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
@@ -162,21 +162,38 @@ def _empty_enrichment(status: str, note: str = "") -> Dict[str, Any]:
 def _enrich_one(
     client: anthropic.Anthropic,
     signal: Dict[str, Any],
+    apollo_vertical: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Enrich a single signal. Never raises — failures encoded in fetch_status."""
+    """Enrich a single signal. Never raises — failures encoded in fetch_status.
+
+    If `apollo_vertical` is provided, also query Apollo for candidate contacts
+    at the company and attach them as `apollo_contacts`. Apollo failures
+    silently degrade — the signal still returns with the article-extracted
+    fields intact.
+    """
     url = signal.get("source_url", "")
     if not url:
-        return {**signal, **_empty_enrichment("no_url", "Signal had no source URL.")}
+        return {
+            **signal,
+            **_empty_enrichment("no_url", "Signal had no source URL."),
+            "apollo_contacts": [],
+        }
 
     article = fetch_article(url)
     if article is None:
-        return {
+        result = {
             **signal,
             **_empty_enrichment(
                 "fetch_failed",
                 "Couldn't fetch or parse the source (paywall, 404, JS-only, or blocked).",
             ),
         }
+        # Still attempt Apollo even if article fetch failed — the signal
+        # has a company name from Gemini, which is enough to look up contacts.
+        result["apollo_contacts"] = _safe_apollo_lookup(
+            signal.get("company", ""), apollo_vertical
+        )
+        return result
 
     try:
         enrichment = extract_detail(client, signal, article)
@@ -187,26 +204,54 @@ def _enrich_one(
                 "extract_failed",
                 f"Article fetched but extraction failed: {type(e).__name__}",
             ),
+            "apollo_contacts": _safe_apollo_lookup(
+                signal.get("company", ""), apollo_vertical
+            ),
         }
 
     enrichment["fetch_status"] = "ok"
     enrichment["fetch_note"] = ""
-    return {**signal, **enrichment}
+    result = {**signal, **enrichment}
+    result["apollo_contacts"] = _safe_apollo_lookup(
+        signal.get("company", ""), apollo_vertical
+    )
+    return result
+
+
+def _safe_apollo_lookup(
+    company: str, vertical: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Call Apollo for contacts at the company. Empty list on any failure or
+    if Apollo augmentation wasn't requested."""
+    if not vertical or not company:
+        return []
+    try:
+        import apollo  # lazy import — module is optional
+        return apollo.find_contacts(company, vertical)
+    except Exception:
+        return []
 
 
 def enrich_signals(
     client: anthropic.Anthropic,
     signals: List[Dict[str, Any]],
     max_workers: int = 8,
+    apollo_vertical: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Enrich a list of signals in parallel. Preserves original order."""
+    """Enrich a list of signals in parallel. Preserves original order.
+
+    If `apollo_vertical` is provided AND apollo is configured, each signal
+    is also augmented with Apollo contact candidates (free People Search;
+    does not consume credits).
+    """
     if not signals:
         return []
 
     results: List[Optional[Dict[str, Any]]] = [None] * len(signals)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_to_index = {
-            ex.submit(_enrich_one, client, sig): i for i, sig in enumerate(signals)
+            ex.submit(_enrich_one, client, sig, apollo_vertical): i
+            for i, sig in enumerate(signals)
         }
         for fut in as_completed(future_to_index):
             i = future_to_index[fut]
@@ -219,6 +264,7 @@ def enrich_signals(
                         "unknown_error",
                         f"Unexpected error: {type(e).__name__}: {e}",
                     ),
+                    "apollo_contacts": [],
                 }
 
     return [r for r in results if r is not None]
@@ -231,3 +277,96 @@ def status_summary(signals: List[Dict[str, Any]]) -> Dict[str, int]:
         status = s.get("fetch_status", "not_run")
         counts[status] = counts.get(status, 0) + 1
     return counts
+
+
+# --- Manual signal entry (paste-a-URL flow) ---
+
+
+def build_signal_from_input(
+    client: anthropic.Anthropic,
+    url: str,
+    vertical: str,
+    pasted_text: Optional[str] = None,
+    augment_with_apollo: bool = False,
+) -> Dict[str, Any]:
+    """Build a complete signal record from a manually-supplied URL and/or text.
+
+    Used when a salesperson finds something themselves (most commonly a
+    LinkedIn post they spotted while logged in) and wants to draft an outreach
+    sequence from it.
+
+    Behaviour:
+    - If `pasted_text` is provided and non-empty, we use it as the content
+      source and don't attempt to fetch the URL. This is the LinkedIn path —
+      LinkedIn typically blocks anonymous fetches, so the salesperson copies
+      the post body in directly.
+    - Otherwise we try to fetch the URL via the same fetcher used by the
+      enrichment pass. If that fails, we raise — the UI should prompt the
+      user to paste the text manually.
+    - If `augment_with_apollo` is True, also queries Apollo for candidate
+      contacts at the company. Stored as `apollo_contacts` separate from
+      `named_individuals` (which come from the article itself).
+
+    Returns a dict in the same shape as a Gemini-discovered signal *plus* the
+    enriched fields (operational_problem, named_individuals, etc.), so it can
+    flow into generate_sequence() with no special-casing downstream.
+
+    May return {"error": "..."} if Claude judges the content doesn't contain
+    a usable signal — caller should handle this and surface the message.
+    """
+    if not url or not url.strip():
+        raise ValueError("URL is required.")
+
+    url = url.strip()
+    content: Optional[str] = (pasted_text or "").strip() or None
+
+    if content is None:
+        content = fetch_article(url)
+        if content is None:
+            raise RuntimeError(
+                "Couldn't fetch that URL (login wall, paywall, 404, or "
+                "JS-only page). Paste the post body or article text into "
+                "the text field below and try again."
+            )
+
+    if len(content) < 50:
+        raise RuntimeError(
+            "Content is too short to extract a signal from. Paste at least "
+            "a few sentences of post body or article text."
+        )
+
+    prompt = MANUAL_SIGNAL_PROMPT.format(
+        vertical=vertical,
+        url=url,
+        content=content[:MAX_ARTICLE_CHARS],
+    )
+
+    response = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=1500,
+        temperature=0.1,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = _strip_json(response.content[0].text or "")
+    try:
+        signal = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Claude returned non-JSON output. First 400 chars:\n{text[:400]}"
+        ) from e
+
+    # Pass through Claude's "this isn't a usable signal" verdict to the caller.
+    if isinstance(signal, dict) and "error" in signal and "company" not in signal:
+        return signal
+
+    # Make sure source_url is set (Claude should set it from the template, but
+    # belt-and-braces in case the model dropped it).
+    signal.setdefault("source_url", url)
+    signal["fetch_status"] = "ok"
+    signal["fetch_note"] = "Built from manual input."
+    signal["apollo_contacts"] = _safe_apollo_lookup(
+        signal.get("company", ""),
+        vertical if augment_with_apollo else None,
+    )
+    return signal
