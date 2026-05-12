@@ -28,6 +28,7 @@ import compliance
 import enrichment
 import llm_clients
 import apollo
+import hubspot
 from prompts import VERTICAL_CONTEXT
 
 # ----------------------------------------------------------------------
@@ -119,6 +120,9 @@ with st.sidebar:
     st.caption("Scope: public web sources only (no LinkedIn scraping)")
     st.caption(
         "Apollo: **" + ("configured" if apollo_configured else "not configured") + "**"
+    )
+    st.caption(
+        "HubSpot: **" + ("configured" if hubspot.is_configured() else "not configured") + "**"
     )
 
 # ----------------------------------------------------------------------
@@ -603,3 +607,306 @@ with tab_generate:
                 file_name=fname,
                 mime="application/json",
             )
+
+            # --- Assign to BD via HubSpot ---
+            st.divider()
+            st.markdown("### Assign to a BD")
+
+            if result.status == "BLOCKED":
+                st.warning(
+                    "Compliance Firewall has blocked this sequence — fix the "
+                    "violations before assigning anything out."
+                )
+            elif not hubspot.is_configured():
+                st.info(
+                    "HubSpot isn't configured. Add `[hubspot]` to "
+                    "`.streamlit/secrets.toml` with `private_app_token` and "
+                    "`portal_id` to enable this. Works on any HubSpot tier — "
+                    "no Marketing Hub or add-ons required."
+                )
+            else:
+                # --- BD picker (must come first — required for both actions) ---
+                owners = hubspot.list_owners()
+                if not owners:
+                    st.warning(
+                        "No HubSpot owners found. Check the Private App has "
+                        "`crm.objects.owners.read` scope, and that there are "
+                        "Users in Settings > Users & Teams."
+                    )
+                else:
+                    owner_options = {
+                        f"{o['name']} <{o['email']}>": o["id"] for o in owners
+                    }
+                    bd_label = st.selectbox(
+                        "Assign to BD",
+                        list(owner_options.keys()),
+                        key="hubspot_bd",
+                    )
+                    bd_owner_id = owner_options[bd_label]
+
+                    # --- Recipient block (shared between task + meeting) ---
+                    st.markdown("**Recipient (the prospect)**")
+                    named = signal.get("named_individuals") or []
+                    apollo_contacts = signal.get("apollo_contacts") or []
+                    revealed = st.session_state.get("revealed_emails", {})
+
+                    options = ["Enter manually"]
+                    option_map: dict[str, dict] = {}
+                    for person in named:
+                        label = f"{person.get('name', '')} — {person.get('role', '')} (from article)"
+                        options.append(label)
+                        option_map[label] = {
+                            "name": person.get("name", ""),
+                            "title": person.get("role", ""),
+                            "email": "",
+                        }
+                    for contact in apollo_contacts:
+                        aid = contact.get("apollo_id", "")
+                        email_addr = revealed.get(aid)
+                        if email_addr:
+                            label = (
+                                f"{contact.get('name', '')} — "
+                                f"{contact.get('title', '')} "
+                                "(from Apollo, email revealed)"
+                            )
+                            options.append(label)
+                            option_map[label] = {
+                                "name": contact.get("name", ""),
+                                "title": contact.get("title", ""),
+                                "email": email_addr,
+                            }
+
+                    pick = st.selectbox(
+                        "Pre-fill from", options, key="hubspot_recipient"
+                    )
+                    chosen = option_map.get(pick, {})
+
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        recipient_email = st.text_input(
+                            "Email",
+                            value=chosen.get("email", ""),
+                            placeholder="name@company.com.au",
+                            key="hubspot_email",
+                        )
+                        recipient_name = st.text_input(
+                            "Name",
+                            value=chosen.get("name", ""),
+                            key="hubspot_name",
+                        )
+                    with rc2:
+                        recipient_title = st.text_input(
+                            "Title",
+                            value=chosen.get("title", ""),
+                            key="hubspot_title",
+                        )
+                        company_name = st.text_input(
+                            "Company",
+                            value=signal.get("company", ""),
+                            key="hubspot_company",
+                        )
+
+                    # Useful body text reused by both task and meeting.
+                    email_body_default = email.get("body", "")
+                    phone = sequence.get("phone_script", {}) or {}
+                    phone_script_text = "\n\n".join(
+                        filter(
+                            None,
+                            [
+                                f"**Opener:** {phone.get('opener', '')}",
+                                f"**Value:** {phone.get('value_statement', '')}",
+                                "**Discovery questions:**\n"
+                                + "\n".join(
+                                    f"- {q}"
+                                    for q in phone.get("discovery_questions", [])
+                                    or []
+                                ),
+                                f"**Objection response:** {phone.get('objection_response', '')}",
+                            ],
+                        )
+                    )
+
+                    st.markdown("---")
+                    col_task, col_meeting = st.columns(2)
+
+                    # --- Task panel ---
+                    with col_task:
+                        st.markdown("**📋 Assign a task**")
+                        default_subject = (
+                            f"Follow up: {signal.get('company', '')} — "
+                            f"{signal.get('headline', '')[:60]}"
+                        ).strip(" —")
+                        task_subject = st.text_input(
+                            "Subject",
+                            value=default_subject,
+                            key="hubspot_task_subject",
+                        )
+                        task_body_default = (
+                            f"## Signal\n{signal.get('headline', '')}\n\n"
+                            f"## Mapped course\n{sequence.get('mapped_course', '')}\n\n"
+                            f"## Suggested email\n**Subject:** "
+                            f"{email.get('subject', '')}\n\n{email_body_default}\n\n"
+                            f"## Phone script\n{phone_script_text}"
+                        )
+                        task_body = st.text_area(
+                            "Body / notes",
+                            value=task_body_default,
+                            height=160,
+                            key="hubspot_task_body",
+                        )
+                        from datetime import date, timedelta
+
+                        task_due = st.date_input(
+                            "Due date",
+                            value=date.today() + timedelta(days=2),
+                            key="hubspot_task_due",
+                        )
+                        tcol1, tcol2 = st.columns(2)
+                        with tcol1:
+                            task_priority = st.selectbox(
+                                "Priority",
+                                ["LOW", "MEDIUM", "HIGH"],
+                                index=1,
+                                key="hubspot_task_priority",
+                            )
+                        with tcol2:
+                            task_type = st.selectbox(
+                                "Type",
+                                ["TODO", "CALL", "EMAIL"],
+                                index=0,
+                                key="hubspot_task_type",
+                            )
+                        assign_task = st.button(
+                            "📋 Assign task to BD",
+                            type="primary",
+                            use_container_width=True,
+                            key="hubspot_assign_task",
+                        )
+
+                    # --- Meeting panel ---
+                    with col_meeting:
+                        st.markdown("**🗓️ Book a meeting**")
+                        meeting_title = st.text_input(
+                            "Meeting title",
+                            value=f"Discovery: {signal.get('company', '')}",
+                            key="hubspot_meeting_title",
+                        )
+                        meeting_body = st.text_area(
+                            "Agenda / notes",
+                            value=sequence.get("signal_summary", "")
+                            + "\n\n"
+                            + sequence.get("rationale", ""),
+                            height=160,
+                            key="hubspot_meeting_body",
+                        )
+                        from datetime import date, time as dtime, timedelta
+
+                        mcol1, mcol2 = st.columns(2)
+                        with mcol1:
+                            meeting_date = st.date_input(
+                                "Date",
+                                value=date.today() + timedelta(days=3),
+                                key="hubspot_meeting_date",
+                            )
+                        with mcol2:
+                            meeting_time = st.time_input(
+                                "Start",
+                                value=dtime(10, 0),
+                                key="hubspot_meeting_time",
+                            )
+                        meeting_duration = st.selectbox(
+                            "Duration",
+                            [15, 30, 45, 60],
+                            index=1,
+                            key="hubspot_meeting_duration",
+                            format_func=lambda m: f"{m} min",
+                        )
+                        meeting_location = st.text_input(
+                            "Location (optional)",
+                            placeholder="e.g. Zoom, MS Teams, on-site",
+                            key="hubspot_meeting_location",
+                        )
+                        book_meeting = st.button(
+                            "🗓️ Book meeting for BD",
+                            type="primary",
+                            use_container_width=True,
+                            key="hubspot_book_meeting",
+                        )
+
+                    # --- Action handler ---
+                    if assign_task or book_meeting:
+                        if not recipient_email or "@" not in recipient_email:
+                            st.error("A valid recipient email is required.")
+                        else:
+                            first = ""
+                            last = ""
+                            parts = recipient_name.strip().split(maxsplit=1)
+                            if len(parts) == 2:
+                                first, last = parts
+                            elif len(parts) == 1:
+                                first = parts[0]
+
+                            task_opts = None
+                            if assign_task:
+                                task_opts = {
+                                    "subject": task_subject,
+                                    "body": task_body,
+                                    "due_at_iso": f"{task_due.isoformat()}T17:00:00",
+                                    "priority": task_priority,
+                                    "task_type": task_type,
+                                }
+
+                            meeting_opts = None
+                            if book_meeting:
+                                start_iso = (
+                                    f"{meeting_date.isoformat()}T"
+                                    f"{meeting_time.isoformat()}"
+                                )
+                                meeting_opts = {
+                                    "title": meeting_title,
+                                    "body": meeting_body,
+                                    "start_iso": start_iso,
+                                    "duration_minutes": meeting_duration,
+                                    "location": meeting_location,
+                                }
+
+                            with st.spinner("Syncing to HubSpot..."):
+                                hubspot_result = hubspot.sync_to_hubspot(
+                                    recipient_email=recipient_email,
+                                    recipient_first=first,
+                                    recipient_last=last,
+                                    recipient_title=recipient_title,
+                                    company_name=company_name,
+                                    bd_owner_id=bd_owner_id,
+                                    create_task_opts=task_opts,
+                                    create_meeting_opts=meeting_opts,
+                                )
+                            st.session_state.hubspot_result = hubspot_result
+
+                    hubspot_result = st.session_state.get("hubspot_result")
+                    if hubspot_result:
+                        st.markdown("**Sync result**")
+                        if hubspot_result.get("contact_url"):
+                            st.markdown(
+                                f"👤 Contact: [open in HubSpot]"
+                                f"({hubspot_result['contact_url']})"
+                            )
+                        if hubspot_result.get("company_url"):
+                            st.markdown(
+                                f"🏢 Company: [open in HubSpot]"
+                                f"({hubspot_result['company_url']})"
+                            )
+                        if hubspot_result.get("task_url"):
+                            st.success(
+                                f"📋 Task assigned: [open in HubSpot]"
+                                f"({hubspot_result['task_url']})"
+                            )
+                        if hubspot_result.get("meeting_url"):
+                            st.success(
+                                f"🗓️ Meeting booked: [open in HubSpot]"
+                                f"({hubspot_result['meeting_url']})"
+                            )
+                        for err in hubspot_result.get("errors", []):
+                            st.warning(f"⚠️ {err}")
+
+
