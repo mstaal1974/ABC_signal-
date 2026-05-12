@@ -705,6 +705,32 @@ with tab_generate:
                             key="hubspot_company",
                         )
 
+                    # --- Handoff notes (appointment setter -> BD) ---
+                    st.markdown("---")
+                    st.markdown("**Notes for the BD**")
+                    handoff_notes = st.text_area(
+                        "Notes from this call / contact",
+                        placeholder=(
+                            "e.g. Spoke briefly with reception, lab manager "
+                            "Sarah back Mon. They're hiring 3 chem techs urgently "
+                            "for the new NATA scope extension. Sarah prefers a call "
+                            "before 10am."
+                        ),
+                        height=120,
+                        key="hubspot_handoff_notes",
+                        label_visibility="collapsed",
+                    )
+                    include_briefing = st.checkbox(
+                        "Include AI briefing alongside the notes",
+                        value=True,
+                        key="hubspot_include_briefing",
+                        help=(
+                            "Bundles the signal context, mapped course, "
+                            "suggested email, and phone script into the same "
+                            "handoff block. Uncheck for a notes-only handoff."
+                        ),
+                    )
+
                     st.markdown("---")
                     st.markdown(
                         "**Handoff action.** Assigns the contact to the BD "
@@ -732,6 +758,32 @@ with tab_generate:
                             elif len(parts) == 1:
                                 first = parts[0]
 
+                            briefing_text = ""
+                            if include_briefing:
+                                phone = sequence.get("phone_script", {}) or {}
+                                discovery = "\n".join(
+                                    f"- {q}"
+                                    for q in (phone.get("discovery_questions", []) or [])
+                                )
+                                briefing_text = "\n\n".join(
+                                    filter(
+                                        None,
+                                        [
+                                            f"Signal: {signal.get('headline', '')}",
+                                            f"Operational read: {sequence.get('signal_summary', '')}",
+                                            f"Mapped course: {sequence.get('mapped_course', '')}",
+                                            f"Rationale: {sequence.get('rationale', '')}",
+                                            f"Suggested email subject: {email.get('subject', '')}",
+                                            f"Suggested email body:\n{email.get('body', '')}",
+                                            "Phone script:",
+                                            f"  Opener: {phone.get('opener', '')}",
+                                            f"  Value: {phone.get('value_statement', '')}",
+                                            f"  Discovery:\n{discovery}" if discovery else "",
+                                            f"  Objection response: {phone.get('objection_response', '')}",
+                                        ],
+                                    )
+                                )
+
                             with st.spinner("Syncing to HubSpot..."):
                                 hubspot_result = hubspot.sync_to_hubspot(
                                     recipient_email=recipient_email,
@@ -740,6 +792,9 @@ with tab_generate:
                                     recipient_title=recipient_title,
                                     company_name=company_name,
                                     bd_owner_id=bd_owner_id,
+                                    handoff_notes=handoff_notes,
+                                    briefing=briefing_text,
+                                    by_user=st.session_state.get("username", ""),
                                 )
                             st.session_state.hubspot_result = hubspot_result
 
@@ -760,6 +815,10 @@ with tab_generate:
                             st.success(
                                 f"🤝 Assigned to **{bd_label}** — they'll see "
                                 "this contact in their HubSpot inbox."
+                            )
+                        if hubspot_result.get("notes_saved"):
+                            st.success(
+                                "📝 Handoff notes saved to the contact in HubSpot."
                             )
                         meeting_link = hubspot_result.get("meeting_link")
                         if meeting_link and meeting_link.get("link"):

@@ -290,6 +290,89 @@ def set_contact_owner(contact_id: str, owner_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Handoff notes
+# ---------------------------------------------------------------------------
+
+
+def _notes_property_name() -> str:
+    """Which contact property holds handoff notes. Defaults to `description`
+    (no HubSpot setup required). Override in secrets.toml if you'd prefer
+    a custom property — e.g. notes_property_name = "handoff_notes" — but
+    note you'll have to create that property in HubSpot first."""
+    return _config().get("notes_property_name", "description")
+
+
+def get_contact_property(contact_id: str, property_name: str) -> Optional[str]:
+    """Read a single property value from a contact. Returns '' if the
+    property is unset, None on error."""
+    if not (contact_id and property_name):
+        return None
+    data = _get(
+        f"/crm/v3/objects/contacts/{contact_id}?properties={property_name}"
+    )
+    if not data or "_error" in data:
+        return None
+    return (data.get("properties") or {}).get(property_name) or ""
+
+
+def set_contact_property(contact_id: str, property_name: str, value: str) -> bool:
+    """Overwrite a single contact property."""
+    if not (contact_id and property_name):
+        return False
+    resp = _patch(
+        f"/crm/v3/objects/contacts/{contact_id}",
+        {"properties": {property_name: value}},
+    )
+    return resp is not None and "_error" not in resp
+
+
+def append_handoff_notes(
+    contact_id: str,
+    notes_text: str,
+    briefing: str = "",
+    by_user: str = "",
+) -> bool:
+    """Prepend a timestamped handoff block to the contact's notes property.
+    Preserves any existing content below it so we don't trample prior notes.
+
+    Structure of the block:
+        === HANDOFF (2026-05-12 14:30 UTC — sales@rto.com.au) ===
+        <appointment setter's notes>
+
+        --- AI briefing ---
+        <briefing content>
+
+        === Earlier notes ===
+        <whatever was there before>
+    """
+    if not contact_id or (not notes_text and not briefing):
+        return False
+
+    prop = _notes_property_name()
+    existing = get_contact_property(contact_id, prop)
+    if existing is None:  # read failed — bail rather than risk overwriting
+        return False
+
+    from datetime import datetime
+
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    header = f"=== HANDOFF ({timestamp}"
+    if by_user:
+        header += f" — {by_user}"
+    header += ") ==="
+
+    blocks = [header]
+    if notes_text.strip():
+        blocks.append(notes_text.strip())
+    if briefing.strip():
+        blocks.append("--- AI briefing ---\n" + briefing.strip())
+    if existing.strip():
+        blocks.append("=== Earlier notes ===\n" + existing.strip())
+
+    return set_contact_property(contact_id, prop, "\n\n".join(blocks))
+
+
+# ---------------------------------------------------------------------------
 # Meeting link lookup
 # ---------------------------------------------------------------------------
 
@@ -352,17 +435,29 @@ def sync_to_hubspot(
     recipient_title: str = "",
     company_name: str = "",
     bd_owner_id: str,
+    handoff_notes: str = "",
+    briefing: str = "",
+    by_user: str = "",
 ) -> Dict[str, Any]:
-    """One-shot: contact + company + association + owner assignment + meeting link.
+    """One-shot: contact + company + association + owner + notes + meeting link.
+
+    Args:
+        recipient_*: prospect details for find-or-create contact.
+        company_name: prospect's company.
+        bd_owner_id: HubSpot user_id of the BD receiving the handoff.
+        handoff_notes: free-text notes from the appointment setter for the BD.
+        briefing: optional AI-generated briefing (signal context, suggested
+            email, phone script). Bundled alongside the notes.
+        by_user: identifier of who is doing the handoff (typically the
+            current Streamlit username). Shown in the notes header.
 
     Returns:
         {
-          "contact_id":   str | None,
-          "contact_url":  str | None,
-          "company_id":   str | None,
-          "company_url":  str | None,
+          "contact_id", "contact_url",
+          "company_id", "company_url",
           "owner_set":    bool,
-          "meeting_link": {"name", "link", "type"} | None,
+          "notes_saved":  bool,
+          "meeting_link": {...} | None,
           "errors":       [str, ...],
         }
     """
@@ -372,6 +467,7 @@ def sync_to_hubspot(
         "company_id": None,
         "company_url": None,
         "owner_set": False,
+        "notes_saved": False,
         "meeting_link": None,
         "errors": [],
     }
@@ -426,13 +522,26 @@ def sync_to_hubspot(
             f"Couldn't assign the BD as contact owner — {_scope_or_message_hint('owner assignment')}"
         )
 
-    # 4. Look up the BD's meeting link
+    # 4. Save handoff notes (and/or AI briefing) to the contact's notes
+    #    property, prepended to whatever was already there.
+    if handoff_notes.strip() or briefing.strip():
+        if append_handoff_notes(
+            contact_id,
+            notes_text=handoff_notes,
+            briefing=briefing,
+            by_user=by_user,
+        ):
+            result["notes_saved"] = True
+        else:
+            result["errors"].append(
+                f"Couldn't save handoff notes — {_scope_or_message_hint('notes')}"
+            )
+
+    # 5. Look up the BD's meeting link
     link = get_meeting_link_for_owner(bd_owner_id)
     if link:
         result["meeting_link"] = link
     else:
-        # Not necessarily an error — the BD might just not have a personal
-        # meetings link set up in HubSpot yet.
         result["errors"].append(
             "No HubSpot Meetings link found for this BD. They may need to "
             "create one in HubSpot > Sales > Meetings (or the scope "
